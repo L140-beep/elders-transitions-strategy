@@ -1,0 +1,84 @@
+//@version=5
+indicator("Elder's Impulse Transition Alert", overlay=true)
+
+// === Настройки ===
+string tfInput = input.timeframe("1W", title="Таймфрейм для анализа")
+bool showCurrentTF = input(true, title="Показывать переходы на текущем ТФ?")
+bool showWeeklyTF = input(true, title="Показывать переходы на выбранном ТФ?")
+
+// Параметры индикаторов
+emaLength = input(13, title="EMA Length")
+macdFast = input(12, title="MACD Fast Length")
+macdSlow = input(26, title="MACD Slow Length")
+macdSignal = input(9, title="MACD Signal Length")
+
+// === Функция для определения состояния импульса ===
+// Возвращаем числовое значение для совместимости с ta.valuewhen()
+getImpulseState(close, ema, macdLine, signalLine) =>
+    if close > ema and macdLine > signalLine
+        1 // LONG
+    else if close < ema and macdLine < signalLine
+        -1 // SHORT
+    else
+        0 // NEUTRAL
+
+// === Функции для MACD ===
+getMACDLine() => 
+    [macdLine, _, _] = ta.macd(close, macdFast, macdSlow, macdSignal)
+    macdLine
+
+getMACDSignal() =>
+    [_, signalLine, _] = ta.macd(close, macdFast, macdSlow, macdSignal)
+    signalLine
+
+// === Расчет на текущем таймфрейме ===
+currentEMA = ta.ema(close, emaLength)
+currentMACD = getMACDLine()
+currentSignal = getMACDSignal()
+currentState = getImpulseState(close, currentEMA, currentMACD, currentSignal)
+prevState = ta.valuewhen(barstate.isconfirmed, currentState[1], 0)
+
+// Функция для преобразования числового состояния в строку
+stateToString(state) =>
+    state == 1 ? "LONG" : state == -1 ? "SHORT" : "NEUTRAL"
+
+// === Расчет на выбранном таймфрейме ===
+weeklyClose = request.security(syminfo.tickerid, tfInput, close)
+weeklyEMA = request.security(syminfo.tickerid, tfInput, ta.ema(close, emaLength))
+weeklyMACD = request.security(syminfo.tickerid, tfInput, getMACDLine())
+weeklySignal = request.security(syminfo.tickerid, tfInput, getMACDSignal())
+weeklyState = getImpulseState(weeklyClose, weeklyEMA, weeklyMACD, weeklySignal)
+
+// Функция для получения предыдущего состояния
+f_prevState() => 
+    var float lastState = 0
+    current = getImpulseState(close, ta.ema(close, emaLength), getMACDLine(), getMACDSignal())
+    if barstate.isconfirmed
+        lastState := current[1]
+    lastState
+
+weeklyPrevState = request.security(syminfo.tickerid, tfInput, f_prevState())
+
+// === Определение переходов ===
+isCurrentLongToNeutral = (prevState == 1 and currentState == 0)
+isCurrentShortToNeutral = (prevState == -1 and currentState == 0)
+
+isWeeklyLongToNeutral = (weeklyPrevState == 1 and weeklyState == 0)
+isWeeklyShortToNeutral = (weeklyPrevState == -1 and weeklyState == 0)
+
+// === Визуализация ===
+currentColor = isCurrentLongToNeutral ? color.new(color.blue, 70) : isCurrentShortToNeutral ? color.new(color.orange, 70) : na
+weeklyColor = isWeeklyLongToNeutral ? color.new(color.blue, 70) : isWeeklyShortToNeutral ? color.new(color.orange, 70) : na
+
+
+barcolor(showCurrentTF and timeframe.period != "1W" ? currentColor : na)
+barcolor(showWeeklyTF and timeframe.period == "1W" ? currentColor : na)
+plot(showWeeklyTF ? weeklyEMA : na, "Weekly EMA", color.purple, 2)
+
+// === Создание таблицы ===
+var table impulseTable = table.new(position.top_right, 2, 3, border_width=1)
+
+// Функция для текста перехода
+getTransitionText(isLongToNeutral, isShortToNeutral) =>
+    isLongToNeutral ? "🔵 LONG → NEUTRAL" : isShortToNeutral ? "🟠 SHORT → NEUTRAL" : "—"
+
