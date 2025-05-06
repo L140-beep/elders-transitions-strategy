@@ -1,0 +1,74 @@
+//@version=5
+indicator("Elder's Impulse System with MACD Histogram", overlay=true)
+
+// === Настройки ===
+string tfInput = input.timeframe("1W", title="Анализируемый таймфрейм")
+bool showCurrentTF = input(true, title="Показывать переходы на текущем ТФ?")
+bool showWeeklyTF = input(true, title="Показывать переходы на выбранном ТФ?")
+
+// Параметры индикаторов
+emaLength = input(13, "EMA Length")
+macdFast = input(12, "MACD Fast")
+macdSlow = input(26, "MACD Slow")
+macdSignal = input(9, "MACD Signal")
+
+// === Функции ===
+// Функция для получения предыдущего значения гистограммы
+getPrevHist() =>
+    [_, _, histLine] = ta.macd(close, macdFast, macdSlow, macdSignal)
+    nz(histLine[1])
+
+// Получение компонентов MACD
+getMACD(src) =>
+    [macdLine, signalLine, histLine] = ta.macd(src, macdFast, macdSlow, macdSignal)
+    [macdLine, signalLine, histLine]
+
+// Определение состояния импульса
+getImpulseState(close, ema, histLine, prevHistLine) =>
+    if close > ema and histLine > prevHistLine
+        1 // LONG (покупательный импульс)
+    else if close < ema and histLine < prevHistLine
+        -1 // SHORT (продажный импульс)
+    else
+        0 // NEUTRAL (нейтральное состояние)
+
+// === Расчет на текущем ТФ ===
+[currentMACD, currentSignal, currentHist] = getMACD(close)
+prevHist = getPrevHist()
+currentEMA = ta.ema(close, emaLength)
+currentState = getImpulseState(close, currentEMA, currentHist, prevHist)
+prevState = ta.valuewhen(barstate.isconfirmed, currentState[1], 0)
+
+[_, _, macd] = getMACD(close)
+// === Расчет на выбранном ТФ ===
+// Получаем все необходимые данные одним запросом для оптимизации
+[weeklyClose, weeklyEMA, weeklyHist, weeklyPrevHist] = request.security(syminfo.tickerid, tfInput, 
+     [close, ta.ema(close, emaLength), macd, getPrevHist()])
+
+weeklyState = getImpulseState(weeklyClose, weeklyEMA, weeklyHist, weeklyPrevHist)
+
+// Функция для получения предыдущего состояния на недельном ТФ
+f_prevWeeklyState() =>
+    var int lastState = 0
+    [_, _, _macd] = getMACD(close)
+    current = getImpulseState(close, ta.ema(close, emaLength), _macd, getPrevHist())
+    if barstate.isconfirmed
+        lastState := current[1]
+    lastState
+
+weeklyPrevState = request.security(syminfo.tickerid, tfInput, f_prevWeeklyState())
+
+// === Определение переходов ===
+isCurrentLongToNeutral = (prevState == 1 and currentState == 0)
+isCurrentShortToNeutral = (prevState == -1 and currentState == 0)
+isWeeklyLongToNeutral = (weeklyPrevState == 1 and weeklyState == 0)
+isWeeklyShortToNeutral = (weeklyPrevState == -1 and weeklyState == 0)
+
+currentColor = isCurrentLongToNeutral ? color.new(color.blue, 70) : isCurrentShortToNeutral ? color.new(color.orange, 70) : na
+weeklyColor = isWeeklyLongToNeutral ? color.new(color.blue, 70) : isWeeklyShortToNeutral ? color.new(color.orange, 70) : na
+
+// === Отображение сигналов ===
+// if showS
+barcolor(barstate.isconfirmed and showCurrentTF and timeframe.period != "1W" ? currentColor : na)
+barcolor(barstate.isconfirmed and showWeeklyTF and timeframe.period == "1W" ? currentColor : na)
+plot(showWeeklyTF ? weeklyEMA : na, "Weekly EMA", color.purple, 2)
