@@ -1,16 +1,23 @@
 # Улучшенный скрипт с разделением результатов по категориям
 import backtrader as bt
 import csv
+import os
 import yfinance as yf
 import pandas as pd
+import math
 from datetime import datetime
+from datetime import datetime
+
+started = False
 
 
 class ImprovedElderStrategy(bt.Strategy):
     params = dict(
         ema_len=13, macd_fast=12, macd_slow=26, macd_signal=9,
         adx_len=14, adx_threshold=15,
-        atr_len=14, risk_percent=1.0,
+        atr_len=14, atr_min=0.1, atr_max=5.0,
+        risk_percent=1.0,
+        soft_margin_leverage=1.5,
         tp_mult=1.5, sl_mult=1.0,
         rsi_period=14, rsi_low=30, rsi_high=70,
         ema_trend=200
@@ -18,85 +25,136 @@ class ImprovedElderStrategy(bt.Strategy):
 
     def __init__(self):
         daily, weekly = self.datas[0], self.datas[1]
+
         self.emaW = bt.ind.EMA(weekly.close, period=self.p.ema_len)
-        macdW = bt.ind.MACD(weekly.close, period_me1=self.p.macd_fast,
-                            period_me2=self.p.macd_slow, period_signal=self.p.macd_signal)
+        macdW = bt.ind.MACD(
+            weekly.close,
+            period_me1=self.p.macd_fast,
+            period_me2=self.p.macd_slow,
+            period_signal=self.p.macd_signal
+        )
         self.histW = macdW.macd - macdW.signal
         self.adxW = bt.ind.ADX(weekly, period=self.p.adx_len).adx
+
         self.atr = bt.ind.ATR(daily, period=self.p.atr_len)
         self.ema200 = bt.ind.EMA(daily.close, period=self.p.ema_trend)
         self.rsi = bt.ind.RSI(daily.close, period=self.p.rsi_period)
-        self.debugfile = "eurjpy_debug.csv"
+
+        self.logfile = "backtest_log.csv"
+        self.ticker = self.datas[0]._name
 
     def start(self):
-        self.ticker = self.datas[0]._name or "UNKNOWN"
-        if self.ticker == "EURJPY=X":
-            self.logfile = "eurjpy_trades.csv"
-            with open(self.logfile, mode='w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(["date", "ticker", "type",
-                                "price", "size", "status"])
-            with open(self.debugfile, mode='w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(["date", "close", "atr", "cash",
-                                "risk_per_trade", "raw_size", "final_size"])
-
-    def debug_log(self, dt, close, atr, cash, risk_per_trade, raw_size, final_size):
-        with open(self.debugfile, mode='a', newline='') as f:
+        # Заголовок единого лога
+        with open(self.logfile, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([
-                dt.strftime("%Y-%m-%d"),
-                f"{close:.5f}",
-                f"{atr:.5f}",
-                f"{cash:.2f}",
-                f"{risk_per_trade:.2f}",
-                raw_size,
-                final_size
+                "date", "ticker", "record_type",
+                "close", "atr_raw", "atr_bnd",
+                "equity", "risk_amt",
+                "raw_size", "ceil_size", "max_afford", "final_size",
+                "order_type", "order_price", "order_size", "order_status"
             ])
 
+    def log_debug(self, **kwargs):
+        # kwargs: date, close, atr_raw, atr_bnd, equity, risk_amt,
+        #         raw_size, ceil_size, max_afford, final_size
+        row = [
+            kwargs.pop("date"),
+            self.ticker,
+            "DEBUG"
+        ] + [kwargs.get(col, "") for col in [
+            "close", "atr_raw", "atr_bnd",
+            "equity", "risk_amt",
+            "raw_size", "ceil_size", "max_afford", "final_size"
+        ]] + [""]*4  # placeholders for order_* columns
+        with open(self.logfile, 'a', newline='') as f:
+            csv.writer(f).writerow(row)
+
+    def notify_order(self, order):
+        dt = self.data.datetime.date(0)
+        status = order.getstatusname()
+        otype = "BUY" if order.isbuy() else "SELL"
+        price = f"{order.executed.price:.5f}" if order.status == order.Completed else ""
+        size = order.executed.size if order.status == order.Completed else ""
+        row = [
+            dt, self.ticker, "TRADE",
+            "", "", "", "", "", "", "", "", "",
+            otype, price, size, status
+        ]
+        with open(self.logfile, 'a', newline='') as f:
+            csv.writer(f).writerow(row)
+
     def next(self):
+        dt = self.data.datetime.date(0)
         daily = self.datas[0]
+
         if len(self.emaW) < 2:
             return
 
-        dt = self.data.datetime.date(0)
-        curr = (1 if self.emaW[0] > self.emaW[-1] and self.histW[0] > self.histW[-1] else
-                -1 if self.emaW[0] < self.emaW[-1] and self.histW[0] < self.histW[-1] else 0)
-        prev = (1 if self.emaW[-1] > self.emaW[-2] and self.histW[-1] > self.histW[-2] else
-                -1 if self.emaW[-1] < self.emaW[-2] and self.histW[-1] < self.histW[-2] else 0)
+        # тренд+импульс
+        curr = (1 if self.emaW[0] > self.emaW[-1] and self.histW[0] > self.histW[-1]
+                else -1 if self.emaW[0] < self.emaW[-1] and self.histW[0] < self.histW[-1]
+                else 0)
+        prev = (1 if self.emaW[-1] > self.emaW[-2] and self.histW[-1] > self.histW[-2]
+                else -1 if self.emaW[-1] < self.emaW[-2] and self.histW[-1] < self.histW[-2]
+                else 0)
 
         if not self.position:
-            close_price = daily.close[0]
-            atr_val = self.atr[0]
+            close = daily.close[0]
+            atr_raw = self.atr[0]
+            atr_bnd = max(self.p.atr_min, min(self.p.atr_max, atr_raw))
+
+            equity = self.broker.getvalue()
+            risk_amt = equity * self.p.risk_percent / 100
+
+            raw_size = risk_amt / atr_bnd
+            ceil_size = math.ceil(raw_size)
+
             cash = self.broker.getcash()
-            risk_per_trade = self.broker.getvalue() * self.p.risk_percent / 100
+            max_afford = min(
+                math.floor(cash/close),
+                math.floor(equity*(self.p.soft_margin_leverage-1)/close)
+            )
+            final_size = min(ceil_size, max_afford)
 
-            raw_size = risk_per_trade / atr_val
-            final_size = int(raw_size)
-            position_cost = close_price * final_size
+            # лог DEBUG
+            self.log_debug(
+                date=dt, close=f"{close:.5f}",
+                atr_raw=f"{atr_raw:.5f}", atr_bnd=f"{atr_bnd:.5f}",
+                equity=f"{equity:.2f}", risk_amt=f"{risk_amt:.2f}",
+                raw_size=f"{raw_size:.2f}", ceil_size=ceil_size,
+                max_afford=max_afford, final_size=final_size
+            )
 
-            # Проверяем, хватает ли денег
-            while final_size > 0 and position_cost > cash:
-                final_size -= 1
-                position_cost = close_price * final_size
-
-            # Запись отладочной информации
-            if getattr(self, 'ticker', '') == "EURJPY=X":
-                with open("eurjpy_debug.csv", mode='a', newline='') as f:
-                    writer = csv.writer(f)
-                    writer.writerow([
-                        self.data.datetime.date(0),
-                        cash, risk_per_trade, atr_val, raw_size, final_size,
-                        position_cost, close_price
-                    ])
-
-            if final_size > 0:
-                if prev == -1 and curr == 0 and self.adxW[0] > self.p.adx_threshold and self.rsi[0] > self.p.rsi_low and close_price > self.ema200[0]:
+            # вход
+            if final_size > 0 and self.adxW[0] > self.p.adx_threshold:
+                if prev == -1 and curr == 0 and close > self.ema200[0] and self.rsi[0] > self.p.rsi_low:
                     self.buy(size=final_size)
-                    self.entry_price = close_price
-                elif prev == 1 and curr == 0 and self.adxW[0] > self.p.adx_threshold and self.rsi[0] < self.p.rsi_high and close_price < self.ema200[0]:
+                    self.entry_price = close
+                elif prev == 1 and curr == 0 and close < self.ema200[0] and self.rsi[0] < self.p.rsi_high:
                     self.sell(size=final_size)
-                    self.entry_price = close_price
+                    self.entry_price = close
+
+        else:
+            atr_bnd = max(self.p.atr_min, min(self.p.atr_max, self.atr[0]))
+            if self.position.size > 0:
+                tp = self.entry_price + atr_bnd*self.p.tp_mult
+                sl = self.entry_price - atr_bnd*self.p.sl_mult
+                self.sell(size=self.position.size,
+                          exectype=bt.Order.Limit, price=tp)
+                self.sell(size=self.position.size,
+                          exectype=bt.Order.Stop,  price=sl)
+                if curr == -1:
+                    self.close()
+            else:
+                tp = self.entry_price - atr_bnd*self.p.tp_mult
+                sl = self.entry_price + atr_bnd*self.p.sl_mult
+                self.buy(size=abs(self.position.size),
+                         exectype=bt.Order.Limit, price=tp)
+                self.buy(size=abs(self.position.size),
+                         exectype=bt.Order.Stop,  price=sl)
+                if curr == 1:
+                    self.close()
 
 
 def run_backtest(category_tickers, start, end, initial_cash=100000):
@@ -136,14 +194,14 @@ def run_backtest(category_tickers, start, end, initial_cash=100000):
 
 if __name__ == "__main__":
     category_tickers = {
-        "Stocks": [
-            "GAZP.ME", "LKOH.ME", "MGNT.ME", "NVTK.ME",
-            "SNGS.ME", "GMKN.ME", "ROSN.ME", "NLMK.ME", "TATN.ME",
-            "ALRS.ME", "CHMF.ME", "AFKS.ME",
-            "FEES.ME", "IRAO.ME",
-            "PHOR.ME", "RUAL.ME", "TRNFP.ME", "HYDR.ME", "MAGN.ME",
-            "PIKK.ME", "QIWI.ME", "ETLN.ME"
-        ],
+        # "Stocks": [
+        #     "GAZP.ME", "LKOH.ME", "MGNT.ME", "NVTK.ME",
+        #     "SNGS.ME", "GMKN.ME", "ROSN.ME", "NLMK.ME", "TATN.ME",
+        #     "ALRS.ME", "CHMF.ME", "AFKS.ME",
+        #     "FEES.ME", "IRAO.ME",
+        #     "PHOR.ME", "RUAL.ME", "TRNFP.ME", "HYDR.ME", "MAGN.ME",
+        #     "PIKK.ME", "QIWI.ME", "ETLN.ME"
+        # ],
         "Forex": [
             "JPY=X", "EURUSD=X", "GBPUSD=X", "AUDUSD=X", "USDCAD=X",
             "USDCHF=X", "EURJPY=X", "GBPJPY=X", "EURGBP=X", "AUDJPY=X",
